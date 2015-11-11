@@ -47,13 +47,13 @@ let (|NumericIndex|StringIndex|) (items:string[]) =
 let convertIndex (names:string[]) : option<IIndex<'R>> =
   try 
     names 
-    |> Array.map (Convert.changeType<'R>)
+    |> Array.map (Convert.convertType<'R> ConversionKind.Flexible)
     |> Index.ofKeys |> Some
   with _ -> None
 
 /// Convert vector to a boxed array that can be passed to the R provider
-let convertVector : IVector -> obj =
-  { new VectorHelpers.VectorCallSite1<obj> with
+let convertVector (vector:IVector) : obj =
+  { new VectorCallSite<obj> with
       override x.Invoke<'T>(col:IVector<'T>) = 
         // Figure out how to handle missing values - if we can pass NA or NaN to R
         // then we just fill missing values with 'missingVal'
@@ -65,7 +65,7 @@ let convertVector : IVector -> obj =
         // If there are missing values and we do not have filler, try converting to float
         let hasMissing = col.DataSequence |> Seq.exists (fun v -> not v.HasValue)
         if hasMissing && missingVal.IsNone then
-          let colNum = VectorHelpers.tryChangeType<float> col
+          let colNum = VectorHelpers.tryConvertType<float> ConversionKind.Flexible col
           if colNum.HasValue then
             box [| for v in colNum.Value.DataSequence -> if v.HasValue then v.Value else nan  |]
           else
@@ -74,7 +74,7 @@ let convertVector : IVector -> obj =
         // Either there are no missing values, or we can fill them 
         else 
           box [| for v in col.DataSequence -> if v.HasValue then v.Value else missingVal.Value |] }
-  |> VectorHelpers.createVectorDispatcher 
+  |> vector.Invoke
 
 
 /// Creates data frame with the specified row & col indices
@@ -83,8 +83,8 @@ let constructFrame (df:DataFrame) rowIndex colIndex =
   // TODO: Do not always create column with objects - pick int/string/something
   let data = Array.init df.ColumnCount (fun colIndex ->
     let colData = rows |> Array.map (fun r -> r.[colIndex])
-    VectorHelpers.createTypedVector Vectors.ArrayVector.ArrayVectorBuilder.Instance colData)
-  Some(Frame<_,_>(rowIndex, colIndex, Vector.ofValues data))
+    VectorHelpers.createInferredTypeVector Vectors.ArrayVector.ArrayVectorBuilder.Instance colData)
+  Some(Frame<_,_>(rowIndex, colIndex, Vector.ofValues data, IndexBuilder.Instance, VectorBuilder.Instance))
 
 /// Convert R expression to a data frame and return frame of an
 /// appropriate type, based on the values of the indices
@@ -101,7 +101,7 @@ let createDefaultFrame (symExpr:SymbolicExpression) =
 
 /// Convert R expression to a data frame of the specified (expected) type
 let tryCreateFrame (symExpr:SymbolicExpression) : option<Frame<'R, 'C>> =
-  match symExpr with
+  match R.as_data_frame(symExpr) with
   | RDotNet.ActivePatterns.DataFrame df ->
       match convertIndex df.RowNames, convertIndex df.ColumnNames with
       | Some rowIndex, Some colIndex -> constructFrame df rowIndex colIndex
@@ -127,7 +127,7 @@ let tryGetDateTimeKeys (zoo:SymbolicExpression) fromDateTime =
     |> Seq.map (fun v -> DateTime.ParseExact(v, "yyyy-MM-dd HH:mm:ss", invcult))
     |> Seq.map fromDateTime
     |> Some
-  with :? RDotNet.ParseException -> None
+  with :? RDotNet.ParseException | :? RDotNet.EvaluationException -> None
 
 /// Try converting the specified symbolic expression to a time series
 let tryCreateTimeSeries fromDateTime (symExpr:SymbolicExpression) : option<Series<'K, 'V>> = 

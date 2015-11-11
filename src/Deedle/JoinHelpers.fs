@@ -4,7 +4,7 @@
 // Operations and types related to joining - used by both Series and Frame
 // --------------------------------------------------------------------------------------
 
-open Deedle
+open System
 open Deedle.Indices
 open Deedle.Vectors
 
@@ -12,6 +12,8 @@ open Deedle.Vectors
 /// by `Series` and `Frame`. Outer join unions the keys (and may introduce
 /// missing values), inner join takes the intersection of keys; left and
 /// right joins take the keys of the first or the second series/frame.
+///
+/// [category:Parameters and results of various operations]
 type JoinKind = 
   /// Combine the keys available in both structures, align the values that
   /// are available in both of them and mark the remaining values as missing.
@@ -36,6 +38,7 @@ type JoinKind =
 /// [omit]
 /// Implements various helpers that are used by Join operations
 module internal JoinHelpers = 
+  open Deedle.Internal
 
   /// When doing exact join on ordered indices, restrict the new index
   /// so that we do not have to load all data for lazy indices
@@ -44,20 +47,25 @@ module internal JoinHelpers =
        restriction.IsOrdered && sourceIndex.IsOrdered &&
        not restriction.IsEmpty then
       let min, max = restriction.KeyRange
-      sourceIndex.Builder.GetRange(sourceIndex, Some(min, BoundaryBehavior.Inclusive), Some(max, BoundaryBehavior.Inclusive), vector)
+      sourceIndex.Builder.GetRange((sourceIndex, vector), (Some(min, BoundaryBehavior.Inclusive), Some(max, BoundaryBehavior.Inclusive)))
     else sourceIndex, vector
 
   /// When using fancy lookup, first fill values in the vector, before doing the join
   let fillMissing vector lookup = 
     match lookup with
-    | Lookup.NearestSmaller -> Vectors.FillMissing(vector, VectorFillMissing.Direction Direction.Forward)
-    | Lookup.NearestGreater -> Vectors.FillMissing(vector, VectorFillMissing.Direction Direction.Backward)
-    | Lookup.Exact | _ -> vector
+    | Lookup.ExactOrSmaller -> Vectors.FillMissing(vector, VectorFillMissing.Direction Direction.Forward)
+    | Lookup.ExactOrGreater -> Vectors.FillMissing(vector, VectorFillMissing.Direction Direction.Backward)
+    | Lookup.Exact -> vector
+    | _ -> invalidOp "Lookup.Smaller and Lookup.Greater are not supported when joining"
+
+  // Helpers for returning one or the other object
+  let inline returnLeft index left right = index, left, right
+  let inline returnRight index left right = index, right, left
 
   /// Create transformation on indices/vectors representing the join operation
   let createJoinTransformation 
-        (indexBuilder:IIndexBuilder) kind lookup (thisIndex:IIndex<_>) 
-        (otherIndex:IIndex<_>) vector1 vector2 =
+        (indexBuilder:IIndexBuilder) (otherIndexBuilder:IIndexBuilder) kind lookup 
+        (thisIndex:IIndex<_>) (otherIndex:IIndex<_>) thisVector otherVector =
     // Inner/outer join only makes sense with exact lookup
     if lookup <> Lookup.Exact && kind = JoinKind.Inner then
       invalidOp "Join/Zip - Inner join can only be used with Lookup.Exact."
@@ -68,29 +76,33 @@ module internal JoinHelpers =
       invalidOp "Join/Zip - Lookup can be only used when joining/zipping ordered series/frames."
 
     match kind with
-    | JoinKind.Inner ->
-        if thisIndex = otherIndex then
-          thisIndex, vector1, vector2
+    // If this is RIGHT join, then swap 'this' and 'other' - then the rest is the same
+    | Let (thisVector, otherVector, thisIndex, otherIndex, returnLeft) 
+          ((thisVector, otherVector, thisIndex, otherIndex, returnOp), JoinKind.Left) 
+    | Let (thisVector, otherVector, thisIndex, otherIndex, returnRight) 
+          ((otherVector, thisVector, otherIndex, thisIndex, returnOp), JoinKind.Right) ->
+
+        // If they are the same instance, they are the same (no need to realign)
+        if lookup = Lookup.Exact && Object.ReferenceEquals(thisIndex, otherIndex) then
+          returnOp thisIndex thisVector otherVector
         else
-          indexBuilder.Intersect( (thisIndex, vector1), (otherIndex, vector2) )
-    | JoinKind.Left ->
-        let otherRowIndex, vector2 = restrictToRowIndex lookup thisIndex otherIndex vector2
-        if lookup = Lookup.Exact && thisIndex = otherRowIndex then
-          thisIndex, vector1, vector2
-        else
-          let vector2 = fillMissing vector2 lookup
-          let otherRowCmd = indexBuilder.Reindex(otherRowIndex, thisIndex, lookup, vector2, fun _ -> true)
-          thisIndex, vector1, otherRowCmd
-    | JoinKind.Right ->
-        let thisRowIndex, vector1 = restrictToRowIndex lookup otherIndex thisIndex vector1
-        if lookup = Lookup.Exact && thisRowIndex = otherIndex then
-          thisIndex, vector1, vector2
-        else
-          let vector1 = fillMissing vector1 lookup
-          let thisRowCmd = indexBuilder.Reindex(thisRowIndex, otherIndex, lookup, vector1, fun _ -> true)
-          otherIndex, thisRowCmd, vector2
-    | JoinKind.Outer | _ ->
-        if thisIndex = otherIndex then
-          thisIndex, vector1, vector2
-        else
-          indexBuilder.Union( (thisIndex, vector1), (otherIndex, vector2) )
+          // Otherwise, restrict the other index to the "this" range and check structural equality
+          let otherRowIndex, otherVector = restrictToRowIndex lookup thisIndex otherIndex otherVector
+          if lookup = Lookup.Exact && thisIndex = otherRowIndex then
+            returnOp thisIndex thisVector otherVector
+          else
+             // If they are not the same, we actually need to reindex
+            let otherVector = fillMissing otherVector lookup
+            let otherRowCmd = otherIndexBuilder.Reindex(otherRowIndex, thisIndex, lookup, otherVector, fun _ -> true)
+            returnOp thisIndex thisVector otherRowCmd
+
+
+    | JoinKind.Inner | JoinKind.Outer when Object.ReferenceEquals(thisIndex, otherIndex) || thisIndex = otherIndex ->
+        // If they are the same object & same structure, we are done
+        thisIndex, thisVector, otherVector
+
+ 
+    // If they are different, we intersect or union the keys
+    | JoinKind.Inner -> indexBuilder.Intersect( (thisIndex, thisVector), (otherIndex, otherVector) )
+    | JoinKind.Outer -> indexBuilder.Union( (thisIndex, thisVector), (otherIndex, otherVector) )
+    | _ -> invalidOp "Join/Zip - Invalid JoinKind value!"

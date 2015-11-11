@@ -1,8 +1,8 @@
 ﻿#if INTERACTIVE
 #I "../../bin/"
 #load "Deedle.fsx"
-#r "../../packages/NUnit.2.6.3/lib/nunit.framework.dll"
-#r "../../packages/FsCheck.0.9.1.0/lib/net40-Client/FsCheck.dll"
+#r "../../packages/NUnit/lib/nunit.framework.dll"
+#r "../../packages/FsCheck/lib/net40-Client/FsCheck.dll"
 #load "../Common/FsUnit.fs"
 #else
 module Deedle.Tests.LazySeries
@@ -30,21 +30,21 @@ let loadIntegers (lo, lob) (hi, hib) = async {
 [<Test>]
 let ``No call is made when series is created and formatted`` () =
   let r = Recorder()
-  let ls = DelayedSeries.Create(0, 100, spy2 r loadIntegers)
-  ls.Format |> ignore
+  let ls = DelayedSeries.FromValueLoader(0, 100, spy2 r loadIntegers)
+  ls.Format() |> ignore
   r.Values |> shouldEqual []
 
 [<Test>]
 let ``No call is made when series is created and we get the key range`` () =
   let r = Recorder()
-  let ls = DelayedSeries.Create(0, 100, spy2 r loadIntegers)
+  let ls = DelayedSeries.FromValueLoader(0, 100, spy2 r loadIntegers)
   ls.KeyRange |> ignore
   r.Values |> shouldEqual []
 
 [<Test>]
 let ``After creates lower bound exclusive restriction`` () =
   let r = Recorder()
-  let ls = DelayedSeries.Create(0, 100, spy2 r loadIntegers)
+  let ls = DelayedSeries.FromValueLoader(0, 100, spy2 r loadIntegers)
   let actual = ls.After(90) |> Series.observations |> List.ofSeq 
   actual |> shouldEqual [ for i in 91 .. 100 -> i, i ]
   r.Values |> shouldEqual [(90, Exclusive), (100, Inclusive)]
@@ -52,7 +52,7 @@ let ``After creates lower bound exclusive restriction`` () =
 [<Test>]
 let ``Before creates upper bound exclusive restriction`` () =
   let r = Recorder()
-  let ls = DelayedSeries.Create(0, 100, spy2 r loadIntegers)
+  let ls = DelayedSeries.FromValueLoader(0, 100, spy2 r loadIntegers)
   let actual = ls.Before(10) |> Series.observations |> List.ofSeq 
   actual |> shouldEqual [ for i in 0 .. 9 -> i, i ]
   r.Values |> shouldEqual [(0, Inclusive), (10, Exclusive)]
@@ -60,7 +60,7 @@ let ``Before creates upper bound exclusive restriction`` () =
 [<Test>]
 let ``Multiple range restrictions are combined for sample calls`` () =
   let r = Recorder()
-  let ls = DelayedSeries.Create(0, 100, spy2 r loadIntegers)
+  let ls = DelayedSeries.FromValueLoader(0, 100, spy2 r loadIntegers)
   let ls = ls.Before(90)
   let ls = ls.After(10)
   let actual = ls |> Series.observations |> List.ofSeq 
@@ -68,9 +68,21 @@ let ``Multiple range restrictions are combined for sample calls`` () =
   r.Values |> shouldEqual [(10, Exclusive), (90, Exclusive)]
 
 [<Test>]
+let ``Multiple conflicting range restrictions (at the end) lead to empty results`` () =
+  let ls = DelayedSeries.FromValueLoader(0, 100, fun _ _ -> async { 
+    return seq { for i in 0 .. 100 -> KeyValue.Create(i, i) } })   
+  ls.Between(100,99).KeyCount |> shouldEqual 0
+
+[<Test>]
+let ``Multiple conflicting range restrictions (in the middle) lead to empty results`` () =
+  let ls = DelayedSeries.FromValueLoader(0, 100, fun _ _ -> async { 
+    return seq { for i in 0 .. 100 -> KeyValue.Create(i, i) } })   
+  ls.Between(90,89).KeyCount |> shouldEqual 0
+  
+[<Test>]
 let ``Splicing syntax creates inclusive restrictions`` () = 
   let r = Recorder()
-  let ls = DelayedSeries.Create(0, 100, spy2 r loadIntegers)
+  let ls = DelayedSeries.FromValueLoader(0, 100, spy2 r loadIntegers)
   let spliced = ls.[50 .. 60]
   let actual = spliced |> Series.observations |> List.ofSeq
   actual |> shouldEqual [ for i in 50 .. 60 -> i, i ]
@@ -79,7 +91,7 @@ let ``Splicing syntax creates inclusive restrictions`` () =
 [<Test>]
 let ``Adding to data frame creates restriction based on data frame key range`` () = 
   let r = Recorder()
-  let ls = DelayedSeries.Create(0, 100, spy2 r loadIntegers)
+  let ls = DelayedSeries.FromValueLoader(0, 100, spy2 r loadIntegers)
   let df = Frame.ofRowKeys [ 20 .. 30 ]
   df?Test <- ls
   let actual = df?Test |> Series.observations |> List.ofSeq
@@ -88,7 +100,7 @@ let ``Adding to data frame creates restriction based on data frame key range`` (
 
 [<Test>]
 let ``Created series does not contain out-of-range keys, even if the source provides them`` () = 
-  let ls = DelayedSeries.Create(0, 100, fun _ _ -> async { 
+  let ls = DelayedSeries.FromValueLoader(0, 100, fun _ _ -> async { 
     return seq { for i in 0 .. 100 -> KeyValue.Create(i, i) }  })
   ls.[0 .. 0] |> Series.keys |> List.ofSeq |> shouldEqual [0]
   ls.[.. 0] |> Series.keys |> List.ofSeq |> shouldEqual [0]
@@ -98,11 +110,11 @@ let ``Created series does not contain out-of-range keys, even if the source prov
 
 [<Test>]
 let ``Can add projection of a lazy vector to a data frame`` () = 
-  let ls = DelayedSeries.Create(0, 100, fun _ _ -> async { 
+  let ls = DelayedSeries.FromValueLoader(0, 100, fun _ _ -> async { 
     return seq { for i in 0 .. 100 -> KeyValue.Create(i, i) }  })
   let df = Frame.ofColumns [ "Lazy" => ls ]
   df?Test <- ((+) 1) $ ls 
-  df?Lazy - df?Test |> Series.sum |> int |> shouldEqual -101
+  df?Lazy - df?Test |> Stats.sum |> int |> shouldEqual -101
 
 // ------------------------------------------------------------------------------------------------
 // Materialization
@@ -111,7 +123,7 @@ let ``Can add projection of a lazy vector to a data frame`` () =
 [<Test>]
 let ``Can materialize series asynchronously`` () =
   let r = Recorder()
-  let ls = DelayedSeries.Create(0, 100, spy2 r loadIntegers).[40 .. 60]
+  let ls = DelayedSeries.FromValueLoader(0, 100, spy2 r loadIntegers).[40 .. 60]
   let ms = ls.AsyncMaterialize() |> Async.RunSynchronously 
   r.Values |> shouldEqual [(40, Inclusive), (60, Inclusive)]
   ms |> shouldEqual (series [ for i in 40 .. 60 -> i, i] )
@@ -119,7 +131,7 @@ let ``Can materialize series asynchronously`` () =
 [<Test>]
 let ``Discarding async materialization does not call the loader`` () =
   let r = Recorder()
-  let ls = DelayedSeries.Create(0, 100, spy2 r loadIntegers).[40 .. 60]
+  let ls = DelayedSeries.FromValueLoader(0, 100, spy2 r loadIntegers).[40 .. 60]
   ls.AsyncMaterialize() |> ignore
   System.Threading.Thread.Sleep(100)
   r.Values |> shouldEqual []
@@ -127,11 +139,85 @@ let ``Discarding async materialization does not call the loader`` () =
 [<Test>]
 let ``Materializing materialized series is a no-op`` () =
   let r = Recorder()
-  let ls = DelayedSeries.Create(0, 100, spy2 r loadIntegers).[40 .. 60]
+  let ls = DelayedSeries.FromValueLoader(0, 100, spy2 r loadIntegers).[40 .. 60]
   let ms = ls.AsyncMaterialize() |> Async.RunSynchronously 
   r.Values |> shouldEqual [(40, Inclusive), (60, Inclusive)]
   let ms2 = ms.AsyncMaterialize() |> Async.RunSynchronously
   r.Values |> shouldEqual [(40, Inclusive), (60, Inclusive)]
+
+// ------------------------------------------------------------------------------------------------
+// Unioning and intersecting ranges
+// ------------------------------------------------------------------------------------------------
+
+[<Test>]
+let ``Can union valid range with an invalid (negative) range`` () =
+  let ranges = 
+    Ranges.Union
+      ( Ranges.Range((0, Inclusive), (10, Inclusive)),
+        Ranges.Range((30, Inclusive), (20, Inclusive)) )
+  let intComp = System.Collections.Generic.Comparer<int>.Default
+  Ranges.flattenRanges 0 100 intComp ranges |> List.ofSeq
+  |> shouldEqual [(0, Inclusive), (10, Inclusive)]
+
+[<Test>]
+let ``Can intersect valid range with an invalid (negative) range`` () =
+  let ranges = 
+    Ranges.Intersect
+      ( Ranges.Range((0, Inclusive), (100, Inclusive)),
+        Ranges.Range((30, Inclusive), (20, Inclusive)) )
+  let intComp = System.Collections.Generic.Comparer<int>.Default
+  Ranges.flattenRanges 0 100 intComp ranges |> List.ofSeq
+  |> shouldEqual []
+
+[<Test>]
+let ``Can union valid range with an invalid (zero) range`` () =
+  let ranges = 
+    Ranges.Union
+      ( Ranges.Range((0, Inclusive), (10, Inclusive)),
+        Ranges.Range((20, Inclusive), (20, Exclusive)) )
+  let intComp = System.Collections.Generic.Comparer<int>.Default
+  Ranges.flattenRanges 0 100 intComp ranges |> List.ofSeq
+  |> shouldEqual [(0, Inclusive), (10, Inclusive)]
+
+[<Test>]
+let ``Can union valid range with a singleton range`` () =
+  let ranges = 
+    Ranges.Union
+      ( Ranges.Range((0, Inclusive), (10, Inclusive)),
+        Ranges.Range((20, Inclusive), (20, Inclusive)) )
+  let intComp = System.Collections.Generic.Comparer<int>.Default
+  Ranges.flattenRanges 0 100 intComp ranges |> List.ofSeq
+  |> shouldEqual [(0, Inclusive), (10, Inclusive); (20, Inclusive), (20, Inclusive)]
+
+[<Test>]
+let ``Can intersect valid range with a singleton range`` () =
+  let ranges = 
+    Ranges.Intersect
+      ( Ranges.Range((0, Inclusive), (100, Inclusive)),
+        Ranges.Range((20, Inclusive), (20, Inclusive)) )
+  let intComp = System.Collections.Generic.Comparer<int>.Default
+  Ranges.flattenRanges 0 100 intComp ranges |> List.ofSeq
+  |> shouldEqual [(20, Inclusive), (20, Inclusive)]
+
+[<Test>]
+let ``Can intersect two singleton ranges`` () =
+  let ranges = 
+    Ranges.Intersect
+      ( Ranges.Range((5, Inclusive), (5, Inclusive)),
+        Ranges.Range((6, Inclusive), (6, Inclusive)) )
+  let intComp = System.Collections.Generic.Comparer<int>.Default
+  Ranges.flattenRanges 0 100 intComp ranges |> List.ofSeq
+  |> shouldEqual []
+
+[<Test>]
+let ``Contains function works on ranges with invalid high/low order`` () =
+  let ranges = 
+    Ranges.Intersect
+      ( Ranges.Range((0, Inclusive), (100, Inclusive)),
+        Ranges.Range((100, Inclusive), (99, Inclusive)) )
+  let intComp = System.Collections.Generic.Comparer<int>.Default
+  Ranges.contains intComp 100 ranges |> shouldEqual false
+
 
 // ------------------------------------------------------------------------------------------------
 // Random testing

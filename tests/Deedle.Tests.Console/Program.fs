@@ -1,12 +1,16 @@
-﻿module Main
-#if INTERACTIVE
-#I "..\\bin"
-#load "DataFrame.fsx"
+﻿#if INTERACTIVE
+#time
+#I "../../bin"
+#load "Deedle.fsx"
+#r "../../packages/NUnit/lib/nunit.framework.dll"
+#r "../../packages/FsCheck/lib/net40-Client/FsCheck.dll"
+#load "../Common/FsUnit.fs"
+#else
+module Main
 #endif
 
 open System
 open System.Linq.Expressions
-open Deedle.Tests
 open Deedle
 
 // ------------------------------------------------------------------------------------------------
@@ -22,11 +26,14 @@ let colored color =
       member x.Dispose() = Console.ForegroundColor <- prev }
 
 // Measure how long does a test take
-let timed f = 
-  let sw = System.Diagnostics.Stopwatch.StartNew()
-  let res = f()
-  printfn "%dms" sw.ElapsedMilliseconds
-  res
+let timed k f = 
+  let times = ResizeArray<_>()
+  for i in 1 .. k do
+    let sw = System.Diagnostics.Stopwatch.StartNew()
+    let res = f()
+    times.Add(float sw.ElapsedMilliseconds)
+    printfn "%dms (Average: %dms)" sw.ElapsedMilliseconds (int64 (Seq.average times))
+    res
 
 // Measure how long does a test take
 let timedFormat f fmt arg = 
@@ -66,38 +73,119 @@ let testAll () =
 
 open Deedle
 
-let testOne() =
-  //let d1 = Array.init 1000000 float
-  //let d2 = Array.init 1000000 float
+let rnd = System.Random(0)
+(*
+let s0 = series <| Array.init 10000 (fun i -> i => rnd.NextDouble())
+let f0 = frame [ for i in 0 .. 10 -> i => s0 ]
+let f1 = frame [ for i in 0 .. 100 -> i => s0 ]
 
-  let titanic = Frame.ReadCsv(__SOURCE_DIRECTORY__ + @"\..\..\docs\content\data\Titanic.csv")
-  for i in 1 .. 20 do
-    timed(fun () ->
-   
-        let bySex = titanic |> Frame.groupRowsByString "Sex"
-        let survivedBySex = bySex.Columns.["Survived"].As<bool>()
-        let survivals = 
-            survivedBySex
-            |> Series.applyLevel Pair.get1Of2 (fun sr -> 
-                sr.Values |> Seq.countBy id |> series)
-            |> Frame.ofRows
-            |> Frame.indexColsWith ["Survived"; "Died"]
-        survivals?Total <- 
-            bySex
-            |> Frame.applyLevel Pair.get1Of2 Series.countKeys
-        let summary = 
-              [ "Survived (%)" => survivals?Survived / survivals?Total * 100.0
-                "Died (%)" => survivals?Died/ survivals?Total * 100.0 ] |> frame
+let s1 = series <| Array.init 1000000 (fun i -> i*2 => rnd.NextDouble())
+let s2 = series <| Array.init 1000000 (fun i -> i*2+1 => rnd.NextDouble())
 
-        ()
-      //CSharp.Tests.DynamicFrameTests.CanAddSeriesDynamically()
-      //CSharp.Tests.DynamicFrameTests.CanGetSeriesDynamically()
-//      Tests.Frame.``Can group 10x5k data frame by row of type string and nest it (in less than a few seconds)``()
-//      Series(d1, d2).[300000.0 .. 600000.0] |> Series.filter (fun k _ -> true) |> Series.mean
-//      |> ignore
+let ss1 = series <| Array.init 100 (fun i -> i*2 => rnd.NextDouble())
+let ss2 = series <| Array.init 100 (fun i -> i*2+1 => rnd.NextDouble())
+*)
+let testOne() =      
+  // 970 ~~> 457
+  printfn "Creating lots of small series"
+  timed 10 (fun () ->
+    let vs = [ for i in 0 .. 10 -> i => float i ]
+    Array.init 100000 (fun _ -> series vs) |> ignore
+  )
+  // 196 ~~> 122
+  printfn "Creating few large series"
+  timed 10 (fun () ->
+    let vs = [ for i in 0 .. 10000 -> i => float i ]
+    Array.init 100 (fun _ -> series vs) |> ignore
+  )
 
-    )
+(*
+  timed 5 (fun () ->
+    s1.ZipInner(s1)
+    |> ignore
+  )
+  timed 5 (fun () ->
+    s1.ZipInner(s1)
+    |> ignore
+  )
+*)
+  // 1288ms
+  // 1286ms
+
+(*
+  timed 10 (fun () ->
+    s1.Select(fun kvp -> kvp.Value * 2.0) |> ignore
+
+    // Selection
+    // Sorting
+
+    // 390
+  )
+
+  timed 10 (fun () ->
+    for i in 0 .. 5000 do 
+      ss1.Select(fun kvp -> kvp.Value * 2.0) |> ignore
+
+    // 177
+  )
+*)
+  ()  
+//  Deedle.Tests.Frame.``Applying (+) on frame & series introduces missing values``()
+
+(*
+  printfn "Slow KeyCount"
+  timed 5 (fun () ->
+    f1.Rows.KeyCount |> ignore
+  )
+  printfn "Fast KeyCount"
+  timed 5 (fun () ->
+    f1.FastRows.KeyCount |> ignore
+  )
+  
+  printfn "Slow iterate"
+  timed 5 (fun () ->
+    f1.Rows |> Series.mapValues (fun r -> r.GetAs<float>(5)) |> ignore
+  )
+  printfn "Fast iterate"
+  timed 5 (fun () ->
+    f1.FastRows |> Series.mapValues (fun r -> r.GetAs<float>(5)) |> ignore
+  )
+*)
+
+  (*
+  timed 5 (fun () ->
+
+    ()
+  
+    // 75 ms ~> 40 ms
+    //f0 + s0 |> ignore
+
+    // 750 ms ~> 360 ms
+    //f1 + s0 |> ignore
+
+    // 315ms
+    //for i in 0 .. 1000 do (s0 |> Stats.movingMin 100 |> ignore)
+
+    // 310ms
+    //s1 |> Stats.movingMin 100 |> ignore
+
+    // 190ms
+    //s1 |> Stats.expandingMin |> ignore
+    // 1950ms
+    //s2 |> Stats.expandingMin |> ignore
+
+    // 325ms
+    //s1 |> Stats.movingMin 100000 |> ignore
+
+    // 320ms
+    //s1 |> Stats.movingMin 500000 |> ignore
+
+    // 3250ms
+    //s2 |> Stats.movingMin 100 |> ignore
+    ()
+
+  )
+  *)
 
 //do testAll()
 do testOne()
-

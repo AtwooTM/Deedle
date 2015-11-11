@@ -19,9 +19,12 @@ module internal Ranges =
     | Intersect of Ranges<'T> * Ranges<'T>
     | Union of Ranges<'T> * Ranges<'T>
 
-  let containsRange f input =
+  let containsRange (comparer:System.Collections.Generic.IComparer<_>) f input =
+    let (<) a b = comparer.Compare(a, b) < 0
     let rec loop = function
-      | Range(l, h) -> f l h
+      | Range(((lo, lobh) as l), ((hi, hibh) as h)) -> 
+          if (lo < hi) || (lo = hi && lobh = BoundaryBehavior.Inclusive && hibh = BoundaryBehavior.Inclusive) 
+            then f l h else false
       | Union(lo, hi) -> loop lo || loop hi
       | Intersect(lo, hi) -> loop lo && loop hi
     loop input
@@ -31,14 +34,14 @@ module internal Ranges =
   let containsSub (comparer:System.Collections.Generic.IComparer<_>) rlo rhi input =
     let (<=) a b = comparer.Compare(a, b) <= 0
     let (>=) a b = comparer.Compare(a, b) >= 0
-    input |> containsRange (fun (lo, _) (hi, _) ->
+    input |> containsRange comparer (fun (lo, _) (hi, _) ->
       rlo >= lo && rhi <= hi)
 
   /// Test if a range contains the specified value
   let contains (comparer:System.Collections.Generic.IComparer<_>) x input =
     let (<) a b = comparer.Compare(a, b) < 0
     let (>) a b = comparer.Compare(a, b) > 0
-    input |> containsRange (fun (lo, lob) (hi, hib) ->
+    input |> containsRange comparer (fun (lo, lob) (hi, hib) ->
       (x > lo && x < hi) || (x = lo && lob = Inclusive) || (x = hi && hib = Inclusive))
 
   /// Returns an ordered sequence of exclusive ranges
@@ -49,12 +52,16 @@ module internal Ranges =
     let (>=) a b = comparer.Compare(a, b) >= 0
 
     // First we get all boundary points in the range tree and sort them
-    let rec getBoundaries ranges = seq {
-      match ranges with 
-      | Range((lo, _), (hi, _)) -> yield! [lo; hi]
-      | Union(l, r) | Intersect(l, r) -> 
-          yield! getBoundaries l
-          yield! getBoundaries r }
+    let rec getBoundaries ranges = 
+      seq {
+        match ranges with 
+        | Range((lo, lobh), (hi, hibh)) -> 
+            if (lo < hi) || (lo = hi && lobh = BoundaryBehavior.Inclusive && hibh = BoundaryBehavior.Inclusive) 
+              then yield! [lo; hi]
+        | Union(l, r) | Intersect(l, r) -> 
+            yield! getBoundaries l
+            yield! getBoundaries r }
+
     let allRanges = Seq.concat [seq [overallMin; overallMax]; getBoundaries ranges]
     let sorted = System.Linq.Enumerable.Distinct(allRanges) |> Array.ofSeq
     Array.sortInPlaceWith (fun a b -> comparer.Compare(a, b)) sorted
@@ -102,13 +109,15 @@ module internal Ranges =
 // --------------------------------------------------------------------------------------
 
 open Ranges
+open Deedle.VectorHelpers
 open System.Threading.Tasks
 open System.Collections.Generic
+open System.Collections.ObjectModel
 
 /// Specifies the ranges for which data need to be provided
 type internal DelayedSourceRanges<'K> = (('K * BoundaryBehavior) * ('K * BoundaryBehavior))[]
 /// Result that should be returned in response to `DelayedSourceRanges` request
-type internal DelayedSourceData<'K, 'V> = Async<seq<KeyValuePair<'K, 'V>>>[]
+type internal DelayedSourceData<'K, 'V when 'K : equality> = Async<IIndex<'K> * IVector<'V>>[]
 
 /// This type represents data source for constructing delayed series. To construct
 /// a delayed series, use `DelayedSeries.Create` (this creates index and vector 
@@ -117,11 +126,9 @@ type internal DelayedSourceData<'K, 'V> = Async<seq<KeyValuePair<'K, 'V>>>[]
 /// The function `loader` is called outside of the `async` (on the calling thread)
 /// but the returned async computations are invoked on background thread.
 type internal DelayedSource<'K, 'V when 'K : equality>
-    ( rangeMin:'K, rangeMax:'K, ranges:Ranges<'K>, 
+    ( scheme:IAddressingScheme, rangeMin:'K, rangeMax:'K, ranges:Ranges<'K>, 
+      indexBuilder:IIndexBuilder, vectorBuilder: IVectorBuilder,
       loader:DelayedSourceRanges<'K> -> DelayedSourceData<'K, 'V>) =
-
-  static let vectorBuilder = VectorBuilder.Instance
-  static let indexBuilder = IndexBuilder.Instance
 
   let comparer = System.Collections.Generic.Comparer<'K>.Default
   let (<) a b = comparer.Compare(a, b) < 0
@@ -132,18 +139,24 @@ type internal DelayedSource<'K, 'V when 'K : equality>
   // Lazy computation that returns started task whil loads the data 
   // (we use task here so that we can cache the result)
   let asyncData = Lazy.Create(fun () -> 
-    let ranges = flattenRanges rangeMin rangeMax comparer ranges |> Array.ofSeq
+    let ranges = flattenRanges rangeMin rangeMax comparer ranges |> Array.ofSeq 
     let ops = loader ranges
     async {
-      let data = new ResizeArray<_>(1000)
+      let constrs = ResizeArray<_>()
+      let vectors = ResizeArray<_>()
       for ((lo, lob), (hi, hib)), op in Seq.zip ranges ops do
-        let! rangeValues = op
-        for KeyValue(k, v) in rangeValues do
-          if (k > lo || (k >= lo && lob = Inclusive)) &&
-             (k < hi || (k <= hi && hib = Inclusive)) then data.Add( (k, v) )
-      let vector = vectorBuilder.Create(data.ToArray() |> Array.map snd)
-      let index = indexBuilder.Create(Seq.map fst data, Some true)
-      return index, vector } |> Async.StartAsTask)
+        let! rangeIndex, rangeVector = op
+        constrs.Add( (rangeIndex, Vectors.Return constrs.Count) )
+        vectors.Add( rangeVector )
+
+      // Append all the indices & vectors that we got for segments
+      match constrs.Count with
+      | 0 -> return indexBuilder.Create([], None), vectorBuilder.Create([||])
+      | 1 -> return fst constrs.[0], vectors.[0]
+      | _ -> 
+          let newIndex, cmd = indexBuilder.Merge( List.ofSeq constrs, BinaryTransform.AtMostOne )
+          let newVector = vectorBuilder.Build(newIndex.AddressingScheme, cmd, vectors.ToArray())
+          return newIndex, newVector } |> Async.StartAsTask)
 
   member x.Ranges = ranges
   member x.RangeMax = rangeMax
@@ -153,6 +166,12 @@ type internal DelayedSource<'K, 'V when 'K : equality>
   member x.AsyncData = asyncData.Value
   member x.Index = fst asyncData.Value.Result
   member x.Values = snd asyncData.Value.Result
+  member x.AddressingScheme = scheme
+
+  member x.With(?loader, ?ranges) =  
+    DelayedSource<'K, 'V>
+      ( scheme, rangeMin, rangeMax, defaultArg ranges x.Ranges, indexBuilder, 
+        vectorBuilder, defaultArg loader x.Loader ) 
 
 // --------------------------------------------------------------------------------------
 // Delayed vector, index & index builder
@@ -165,15 +184,19 @@ type internal DelayedVector<'K, 'V when 'K : equality> internal (source:DelayedS
   // Boilerplate - all operations on the vector just force the retrieval 
   // of the data and then delegate the request to the actual vector
   interface IVector with
+    member x.AddressingScheme = source.AddressingScheme
     member val ElementType = typeof<'V>
+    member x.Length = source.Values.Length
     member x.SuppressPrinting = true
     member x.GetObject(index) = source.Values.GetObject(index)
     member x.ObjectSequence = source.Values.ObjectSequence
+    member x.Invoke(site) = site.Invoke<'V>(x)
   interface IVector<'V> with
-    member x.GetValue(index) = source.Values.GetValue(index)
+    member x.GetValue(address) = source.Values.GetValue(address)
+    member x.GetValueAtLocation(loc) = source.Values.GetValueAtLocation(loc)
     member x.Data = source.Values.Data
-    member x.SelectMissing(f) = source.Values.SelectMissing(f)
     member x.Select(f) = source.Values.Select(f)
+    member x.Convert(f, g) = source.Values.Convert(f, g)
 
 
 /// Delayed index that is lnked to a DelayedSource specified during construction
@@ -181,16 +204,20 @@ type internal DelayedVector<'K, 'V when 'K : equality> internal (source:DelayedS
 type internal DelayedIndex<'K, 'V when 'K : equality> internal (source:DelayedSource<'K, 'V>) = 
   member x.Source = source
   interface IIndex<'K> with
-    member x.KeyAt index = source.Index.KeyAt index
+    member x.AddressingScheme = source.AddressingScheme
+    member x.AddressOperations = source.Index.AddressOperations
+    member x.KeyAt index = source.Index.KeyAt index 
     member x.KeyCount = source.Index.KeyCount
     member x.IsEmpty = false
     member x.Builder = DelayedIndexBuilder() :> IIndexBuilder
     member x.KeyRange = source.RangeMin, source.RangeMax
     member x.Keys = source.Index.Keys
+    member x.KeySequence = source.Index.KeySequence
     member x.Locate(key) = source.Index.Locate(key)
     member x.Lookup(key, semantics, check) = source.Index.Lookup(key, semantics, check)
     member x.Mappings = source.Index.Mappings
     member x.IsOrdered = true // source.Index.Ordered
+    member x.AddressAt(offs) = source.Index.AddressAt offs
     member x.Comparer = source.Index.Comparer
   interface IDelayedIndex<'K> with
     member x.Invoke(func) = func.Invoke<'V>(x)
@@ -213,18 +240,23 @@ and internal DelayedIndexFunction<'K, 'R when 'K : equality> =
 and internal DelayedIndexBuilder() =
   let builder = IndexBuilder.Instance
   interface IIndexBuilder with
-    member x.Create(keys, ordered) = builder.Create(keys, ordered)
+    member x.Create(keys:seq<_>, ordered) = builder.Create(keys, ordered)
+    member x.Create(keys:ReadOnlyCollection<_>, ordered) = builder.Create(keys, ordered)
+    member x.Recreate(index) = builder.Recreate(index)
     member x.Aggregate(index, aggregation, vector, selector) = builder.Aggregate(index, aggregation, vector, selector)
     member x.GroupBy(index, keySel, vector) = builder.GroupBy(index, keySel, vector)
     member x.OrderIndex(sc) = builder.OrderIndex(sc)
+    member x.Shift(sc, offset) = builder.Shift(sc, offset)
     member x.Union(sc1, sc2) = builder.Union(sc1, sc2)
-    member x.Append(sc1, sc2, transform) = builder.Append(sc1, sc2, transform)
     member x.Intersect(sc1, sc2) = builder.Intersect(sc1, sc2)
+    member x.Merge(scs, transform) = builder.Merge(scs, transform)
+    member x.Search(sc, idx, value) = builder.Search(sc, idx, value)
     member x.LookupLevel(sc, key) = builder.LookupLevel(sc, key)
     member x.WithIndex(index1, f, vector) = builder.WithIndex(index1, f, vector)
     member x.Reindex(index1, index2, semantics, vector, cond) = builder.Reindex(index1, index2, semantics, vector, cond)
     member x.DropItem(sc, key) = builder.DropItem(sc, key)
-    member x.Resample(index, keys, close, vect, ks, vs) = builder.Resample(index, keys, close, vect, ks, vs)
+    member x.Resample(chunkBuilder, index, keys, close, vect, selector) = builder.Resample(chunkBuilder, index, keys, close, vect, selector)
+    member this.GetAddressRange( (index:IIndex<'K>, vector), range) = builder.GetAddressRange( (index, vector), range) 
     
     member x.Project(index:IIndex<'K>) = 
       // If the index is delayed, then projection evaluates it
@@ -257,7 +289,7 @@ and internal DelayedIndexBuilder() =
       | _ ->
         builder.AsyncMaterialize((index, vector))
 
-    member x.GetRange(index, optLo:option<'K * _>, optHi:option<'K * _>, vector) = 
+    member x.GetRange((index, vector), (optLo:option<'K * _>, optHi:option<'K * _>)) = 
       match index with
       | :? IDelayedIndex<'K> as index ->
         // Use 'index.Invoke' to run the 'Invoke' method of the following
@@ -273,7 +305,7 @@ and internal DelayedIndexBuilder() =
               // range and returns a source for this portion of data
               let restrictSource otherRange loader = 
                 let ranges = Intersect(range, otherRange)
-                DelayedSource<'K, 'V>(index.Source.RangeMin, index.Source.RangeMax, ranges, loader)
+                index.Source.With(ranges=ranges, loader=loader)
                 
               // Create a new Delayed source for this index with more restricted range
               let source = restrictSource index.Source.Ranges index.Source.Loader
@@ -289,15 +321,11 @@ and internal DelayedIndexBuilder() =
                       let source = restrictSource lv.Source.Ranges lv.Source.Loader
                       DelayedVector(source) :> IVector
                 | _ -> 
-                    //let  = builder.GetRange(index, optLo, optHi, Vectors.Return 0)
-                    //ArrayVector.ArrayVectorBuilder.Instance.Build(cmd, [| vector |])
-                    
-
                     failwith "TODO: This should probably be supported?")
               newIndex :> IIndex<'K>, cmd }
         |> index.Invoke
       | _ ->
-        builder.GetRange(index, optLo, optHi, vector)
+        builder.GetRange( (index, vector), (optLo, optHi) )
 
 // --------------------------------------------------------------------------------------
 // Public API for creating delayed series
@@ -310,6 +338,7 @@ open System.Collections.Generic
 open System.Threading.Tasks
 open Deedle.Delayed
 open Deedle.Indices
+open Deedle.Internal
 open Deedle.Vectors.ArrayVector
 
 /// This type exposes a single static method `DelayedSeries.Create` that can be used for
@@ -318,7 +347,7 @@ open Deedle.Vectors.ArrayVector
 /// in a database, but only loads data that are actually needed. For more information
 /// see the [lazy data loading tutorial](../lazysource.html).
 /// 
-/// ### Example
+/// ## Example
 /// 
 /// Assuming we have a function `generate lo hi` that generates data in the specified
 /// `DateTime` range, we can create lazy series as follows:
@@ -331,6 +360,8 @@ open Deedle.Vectors.ArrayVector
 /// The arguments `min` and `max` specfify the complete range of the series. The 
 /// function passed to `Create` is called with minimal and maximal required key
 /// (`lo` and `hi`) and with two values that specify boundary behaviour.
+///
+/// [category:Specialized frame and series types]
 type DelayedSeries =
   /// A C#-friendly function that creates lazily loaded series. The method requires
   /// the overall range of the series (smallest and greatest key) and a function that
@@ -351,8 +382,8 @@ type DelayedSeries =
   /// For more information see the [lazy data loading tutorial](../lazysource.html).
   /// The operation calls `loader` (and so creates the tasks) on the thread that is
   /// requesting the result.
-  static member Create(min, max, loader:Func<_, _, _, _, Task<seq<KeyValuePair<'K, 'V>>>>) : Series<'K, 'V> =
-    DelayedSeries.Create(min, max, fun (l, lb) (h, hb)-> Async.AwaitTask (loader.Invoke(l,lb,h,hb)))
+  static member FromValueLoader(min, max, loader:Func<_, _, _, _, Task<seq<KeyValuePair<'K, 'V>>>>) : Series<'K, 'V> =
+    DelayedSeries.FromValueLoader(min, max, fun (l, lb) (h, hb)-> Async.AwaitTask (loader.Invoke(l,lb,h,hb)))
 
   /// An F#-friendly function that creates lazily loaded series. The method requires
   /// the overall range of the series (smallest and greatest key) and a function that
@@ -371,11 +402,50 @@ type DelayedSeries =
   /// ## Remarks
   ///
   /// For more information see the [lazy data loading tutorial](../lazysource.html).
-  static member Create(min, max, loader:_ -> _ -> Async<_>) : Series<'K, 'V> =
-    let initRange = Ranges.Range((min, BoundaryBehavior.Inclusive), (max, BoundaryBehavior.Inclusive))
-    let series = DelayedSource<'K, 'V>(min, max, initRange, fun ranges -> 
-      ranges |> Array.map (fun (l, h) -> loader l h))
-    let index = DelayedIndex(series)
-    let vector = DelayedVector(series)
+  static member FromValueLoader(min, max, loader:_ -> _ -> Async<seq<KeyValuePair<'K, 'V>>>) : Series<'K, 'V> =
     let vectorBuilder = VectorBuilder.Instance
+    let indexBuilder = IndexBuilder.Instance
+    let initRange = Ranges.Range((min, BoundaryBehavior.Inclusive), (max, BoundaryBehavior.Inclusive))
+    let scheme = Addressing.LinearAddressingScheme.Instance
+    let source = DelayedSource<'K, 'V>(scheme, min, max, initRange, indexBuilder, vectorBuilder, fun ranges -> 
+      ranges |> Array.map (fun ((lo, lob), (hi, hib)) -> async {
+        let! pairs = loader (lo, lob) (hi, hib)
+        let keys = ResizeArray<_>()
+        let values = ResizeArray<_>()
+        for KeyValue(k, v) in pairs do
+          if (k > lo || (k >= lo && lob = Inclusive)) &&
+             (k < hi || (k <= hi && hib = Inclusive)) then 
+             keys.Add(k)
+             values.Add(v)
+        let index = indexBuilder.Create(ReadOnlyCollection.ofSeq keys, Some true)
+        let vector = vectorBuilder.Create(values.ToArray())
+        return index, vector
+      }))
+
+    let index = DelayedIndex(source)
+    let vector = DelayedVector(source)
     Series<'K, 'V>(index, vector, vectorBuilder, DelayedIndexBuilder())
+
+  static member FromIndexVectorLoader
+      (scheme, vectorBuilder, indexBuilder, min, max, loader:Func<_, _, _, _, Task<_>>) : Series<'K, 'V> =
+    DelayedSeries.FromIndexVectorLoader
+      ( scheme, vectorBuilder, indexBuilder, min, max, 
+        fun (l, lb) (h, hb)-> Async.AwaitTask (loader.Invoke(l,lb,h,hb)) )
+
+  static member FromIndexVectorLoader
+      (scheme, vectorBuilder, indexBuilder, min, max, loader:_ -> _ -> Async<_>) : Series<'K, 'V> =
+    let initRange = Ranges.Range((min, BoundaryBehavior.Inclusive), (max, BoundaryBehavior.Inclusive))
+    let source = DelayedSource<'K, 'V>(scheme, min, max, initRange, indexBuilder, vectorBuilder, fun ranges -> 
+      ranges |> Array.map (fun (l, h) -> loader l h))
+    let index = DelayedIndex(source)
+    let vector = DelayedVector(source)
+    Series<'K, 'V>(index, vector, vectorBuilder, DelayedIndexBuilder())
+
+    
+
+  // Obsolete methods - to be deleted at some point
+
+  [<Obsolete("The DelayedSeries.Create method has been renamed to DelayedSeries.FromValueLoader")>]
+  static member Create(min, max, loader:_ -> _ -> _) = DelayedSeries.FromValueLoader(min, max, loader)  
+  [<Obsolete("The DelayedSeries.Create method has been renamed to DelayedSeries.FromValueLoader")>]
+  static member Create(min, max, loader:Func<_, _, _, _, _>) = DelayedSeries.FromValueLoader(min, max, loader)

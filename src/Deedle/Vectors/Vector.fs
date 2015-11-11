@@ -13,23 +13,6 @@ type VectorData<'T> =
   | SparseList of ReadOnlyCollection<OptionalValue<'T>>
   | Sequence of seq<OptionalValue<'T>>
 
-  /// Returns only the non-missing (ie present) values within a vector
-  member x.Values : seq<'T> =
-    match x with
-    | DenseList l -> 
-      seq { yield! l }
-    | SparseList l -> 
-      seq { 
-        for v in l do 
-          if v.HasValue then 
-            yield v.Value }
-    | Sequence l -> 
-      seq { 
-        for v in l do 
-          if v.HasValue then 
-            yield v.Value }
-
-
 // --------------------------------------------------------------------------------------
 // Interfaces (generic & non-generic) for representing vectors
 // --------------------------------------------------------------------------------------
@@ -46,6 +29,8 @@ open Deedle.Addressing
 /// to the values via a generic address. This type should be only used directly when
 /// extending the DataFrame library and adding a new way of storing or loading data.
 /// To allow invocation via Reflection, the vector exposes type of elements as `System.Type`.
+///
+/// [category:Vectors and indices]
 type IVector = 
   /// Returns all values of the vector as a sequence of optional objects
   abstract ObjectSequence : seq<OptionalValue<obj>>
@@ -64,14 +49,51 @@ type IVector =
   /// untyped version of `GetValue` method on a typed vector.
   abstract GetObject : Address -> OptionalValue<obj>
 
+  /// Invokes the specified generic function (vector call site) with the current 
+  /// instance of vector passed as a statically typed vector (ie. IVector<ElementType>)
+  abstract Invoke : VectorCallSite<'R> -> 'R
+
+  /// Returns the number of elements in the vector
+  abstract Length : int64
+
+  /// Returns the addressing scheme of the index. When creating a series or a frame
+  /// this is compared for equality with the addressing scheme of the vector(s).
+  abstract AddressingScheme : IAddressingScheme
+
+/// Represents a generic function `\forall.'T.(IVector<'T> -> 'R)`. The function can be 
+/// generically invoked on an argument of type `IVector` using `IVector.Invoke`
+///
+/// [category:Vectors and indices]
+and VectorCallSite<'R> =
+  abstract Invoke<'T> : IVector<'T> -> 'R
+
+/// Represents a location in a vector. In general, we always know the address, but 
+/// sometimes (BigDeedle) it is hard to get the offset (requires some data lookups),
+/// so we use this interface to delay the calculation of the Offset (which is mainly
+/// needed in one of the `series.Select` overloads)
+///
+/// [category:Vectors and indices]
+and IVectorLocation = 
+  /// Returns the address of the location (this should be immediate) 
+  abstract Address : Address
+  /// Returns the offset of the location (this may involve some calculation)
+  abstract Offset : int64
+
 /// A generic, typed vector. Represents mapping from addresses to values of type `T`. 
 /// The vector provides a minimal interface that is required by series and can be
 /// implemented in a number of ways to provide vector backed by database or an
 /// alternative representation of data.
-type IVector<'T> = 
+///
+/// [category:Vectors and indices]
+and IVector<'T> = 
   inherit IVector 
   /// Returns value stored in the vector at a specified address. 
   abstract GetValue : Address -> OptionalValue<'T>
+
+  /// Returns value stored in the vector at a specified location. 
+  /// This can typically just call 'GetValue(loc.Address)', but it can do something
+  /// more clever using the fact that the caller provided us with the address & offset.
+  abstract GetValueAtLocation : IVectorLocation -> OptionalValue<'T>
 
   /// Returns all data of the vector in one of the supported formats. Depending
   /// on the vector, data may be returned as a continuous block of memory using
@@ -80,21 +102,30 @@ type IVector<'T> =
 
   /// Apply the specified function to all values stored in the vector and return
   /// a new vector (not necessarily of the same representation) with the results.
-  abstract Select : ('T -> 'TNew) -> IVector<'TNew>
-
-  /// Apply the specified function to all values stored in the vector and return
-  /// a new vector (not necessarily of the same representation) with the results.
   /// The function handles missing values - it is called with optional values and
   /// may return a missing value as a result of the transformation.
-  abstract SelectMissing : (OptionalValue<'T> -> OptionalValue<'TNew>) -> IVector<'TNew>
+  abstract Select : (IVectorLocation -> OptionalValue<'T> -> OptionalValue<'TNew>) -> IVector<'TNew>
+
+  /// Create a vector whose values are converted using the specified function, but
+  /// can be converted back using another specified function. For virtualized vectors,
+  /// this enables e.g. efficient lookup on the returned vectors (by delegating the
+  /// lookup to the original source)
+  abstract Convert : ('T -> 'TNew) * ('TNew -> 'T) -> IVector<'TNew>
 
 
 /// Module with extensions for generic vector type. Given `vec` of type `IVector<T>`, 
 /// the extension property `vec.DataSequence` returns all data of the vector converted
 /// to the "least common denominator" data structure - `IEnumerable<T>`.
+///
+/// [category:Vectors and indices]
 [<AutoOpen>]
-module VectorExtensions = 
-  type IVector<'TValue> with
+module ``F# Vector extensions (core)`` = 
+  type IVector<'T> with
+    /// Apply the specified function to all values stored in the vector and return
+    /// a new vector (not necessarily of the same representation) with the results.
+    /// The function skips missing values.
+    member x.Select(f:'T -> 'R) = x.Select(fun _ -> OptionalValue.map f)
+
     /// Returns the data of the vector as a lazy sequence. (This preserves the 
     /// order of elements in the vector and so it also returns missing values.)
     member x.DataSequence = 
@@ -112,26 +143,49 @@ open Deedle
 open Deedle.Internal
 open Deedle.Addressing
 
-/// Represents a range inside a vector
-type VectorRange = Address * Address
+/// An `IVectorLocation` created from a known address and offset
+/// (typically used in LinearIndex/ArrayVector where both are the same)
+type KnownLocation(addr, offset) = 
+  interface IVectorLocation with
+    member x.Address = addr
+    member x.Offset = offset 
 
 /// Representes a "variable" in the mini-DSL below
 type VectorHole = int
 
-/// Represent a transformation that is applied when combining two vectors
-/// (because we are combining untyped `IVector` values, the transformation
-/// is also untyped)
-type IVectorValueTransform =
+/// Represent a transformation that is applied when combining two vectors (because 
+/// we are combining untyped `IVector` values, the transformation is also untyped)
+type IBinaryTransform =
   /// Returns a function that combines two values stored in vectors into a new vector value.
   /// Although generic, this function will only be called with the `T` set to the
   /// type of vector that is being built. Since `VectorConstruction` is not generic,
   /// the type cannot be statically propagated.
   abstract GetFunction<'T> : unit -> (OptionalValue<'T> -> OptionalValue<'T> -> OptionalValue<'T>)
 
+  /// Assuming `*` is the result of `GetFunction`, this property returns true when 
+  /// for all `x` it is the case that `Missing * x = x = x * Missing`. This enables
+  /// certain optimizations (as we do not have to call `*` when one argument is N/A)
+  abstract IsMissingUnit : bool
+
 /// Represent a tranformation that is applied when combining N vectors
-type IVectorValueListTransform =
+/// (This follows exactly the same pattern as `IBinaryTransform`)
+type INaryTransform =
   /// Returns a function that combines N values stored in vectors into a new vector value
   abstract GetFunction<'T> : unit -> (OptionalValue<'T> list -> OptionalValue<'T>)
+
+/// A transformation on vector(s) can specified as binary or as N-ary. A binary transformation
+/// can be applied to N elements using `List.reduce`, but allows optimizations.
+[<RequireQualifiedAccess>]
+type VectorListTransform = 
+  | Binary of IBinaryTransform
+  | Nary of INaryTransform
+  
+/// When an `INaryTransform` implements this interface, it is a special well-known
+/// transformation that creates a _row reader_ vector to be used in `frame.Rows`.
+/// (See the implementation in the `Build` operation in `ArrayVector.fs`)
+type IRowReaderTransform = 
+  inherit INaryTransform
+  abstract ColumnAddressAt : int64 -> Address
 
 /// Specifies how to fill missing values in a vector (when using the 
 /// `VectorConstruction.FillMissing` command). This can only fill missing
@@ -159,8 +213,9 @@ type VectorConstruction =
   /// - this element represent getting one of the variables.
   | Return of VectorHole
 
-  /// Creates an empty vector of the requested type
-  | Empty 
+  /// Creates an empty vector of the requested type and size
+  /// The returned vector is filled with missing values.
+  | Empty of int64 
 
   /// Reorders elements of the vector. Carries a new required vector length and a list
   /// of relocations (each pair of addresses specifies that an element at a new address 
@@ -170,23 +225,18 @@ type VectorConstruction =
 
   /// Drop the specified range of addresses from the vector 
   /// and return a new vector that excludes the range
-  | DropRange of VectorConstruction * VectorRange 
+  | DropRange of VectorConstruction * RangeRestriction<Address> 
 
   /// Get the specified range of addresses from the vector and return it as a new vector
-  | GetRange of VectorConstruction * VectorRange
+  | GetRange of VectorConstruction * RangeRestriction<Address> 
 
   /// Append two vectors after each other
   | Append of VectorConstruction * VectorConstruction
 
-  /// Combine two aligned vectors. The `IVectorValueTransform` object
-  /// specifies how to merge values (in case there is a value at a given address
-  /// in both of the vectors).
-  | Combine of VectorConstruction * VectorConstruction * IVectorValueTransform
-
   /// Combine N aligned vectors. The `IVectorValueListTransform` object
   /// specifies how to merge values (in case there is a value at a given address
   /// in more than one of the vectors).
-  | CombineN of VectorConstruction list * IVectorValueListTransform
+  | Combine of Lazy<int64> * VectorConstruction list * VectorListTransform
 
   /// Create a vector that has missing values filled using the specified direction
   /// (forward means that n-th value will contain (n-i)-th value where (n-i) is the
@@ -213,7 +263,7 @@ type IVectorBuilder =
   /// For example `Double.NaN` or `null` should be turned into a missing
   /// value in the returned vector.
   abstract Create : 'T[] -> IVector<'T>
-  
+
   /// Create a vector from an array containing values that may be missing. 
   /// Even if a value is passed, it may be a missing value such as `Double.NaN`
   /// or `null`. The vector builder should hanlde this.
@@ -222,8 +272,8 @@ type IVectorBuilder =
   /// Apply a vector construction to a given vector. The second parameter
   /// is an array of arguments ("variables") that may be referenced from the
   /// `VectorConstruction` using the `Return 0` construct.
-  abstract Build<'T> : VectorConstruction * IVector<'T>[] -> IVector<'T>
+  abstract Build<'T> : IAddressingScheme * VectorConstruction * IVector<'T>[] -> IVector<'T>
 
   /// Asynchronous version of `Build` operation. This is mainly used for 
   /// `AsyncMaterialize` and it does not handle fully general vector constructions (yet)
-  abstract AsyncBuild<'T> : VectorConstruction * IVector<'T>[] -> Async<IVector<'T>>
+  abstract AsyncBuild<'T> : IAddressingScheme * VectorConstruction * IVector<'T>[] -> Async<IVector<'T>>

@@ -7,31 +7,13 @@
 // Index is an interface and so you can define your own. 
 // --------------------------------------------------------------------------------------
 
-/// Represents different behaviors of key lookup in series. For unordered series,
-/// the only available option is `Lookup.Exact` which finds the exact key - methods
-/// fail or return missing value if the key is not available in the index. For ordered
-/// series `Lookup.NearestGreater` finds the first greater key (e.g. later date) with
-/// a value. `Lookup.NearestSmaller` searches for the first smaller key.
-type Lookup = 
-  /// Lookup a value associated with the exact specified key. 
-  /// If the key is not available, then fail or return missing value. 
-  | Exact = 0
-
-  /// Lookup a value associated with the specified key or with the nearest
-  /// greater key that has a value available. Fails (or returns missing value)
-  /// only when the specified key is greater than all available keys.
-  | NearestGreater = 1
-
-  /// Lookup a value associated with the specified key or with the nearest
-  /// smaller key that has a value available. Fails (or returns missing value)
-  /// only when the specified key is smaller than all available keys.
-  | NearestSmaller = 2
-
 /// Represents a strategy for aggregating data in an ordered series into data segments.
 /// To create a value of this type from C#, use the non-generic `Aggregation` type.
 /// Data can be aggregate using floating windows or chunks of a specified size or 
 /// by specifying a condition on two keys (i.e. end a window/chunk when the condition
 /// no longer holds).
+///
+/// [category:Parameters and results of various operations]
 type Aggregation<'K> =
   /// Aggregate data into floating windows of a specified size 
   /// and the provided handling of boundary elements.
@@ -55,6 +37,8 @@ type Aggregation<'K> =
 /// A non-generic type that simplifies the construction of `Aggregation<K>` values
 /// from C#. It provides methods for constructing different kinds of aggregation
 /// strategies for ordered series.
+///
+/// [category:Parameters and results of various operations]
 type Aggregation =
   /// Aggregate data into floating windows of a specified size 
   /// and the provided handling of boundary elements.
@@ -111,6 +95,8 @@ open Deedle.Keys
 open Deedle.Internal
 open Deedle.Addressing
 open Deedle.Vectors
+open System.Collections.Generic
+open System.Collections.ObjectModel
 
 /// Specifies the boundary behavior for the `IIndexBuilder.GetRange` operation
 /// (whether the boundary elements should be included or not)
@@ -122,11 +108,27 @@ type BoundaryBehavior = Inclusive | Exclusive
 /// extending the DataFrame library and adding a new way of storing or loading data.
 /// Values of this type are constructed using the associated `IIndexBuilder` type.
 type IIndex<'K when 'K : equality> = 
-  /// Returns a sequence of all keys in the index.
-  abstract Keys : seq<'K>
+
+  /// Returns the addressing scheme of the index. When creating a series or a frame
+  /// this is compared for equality with the addressing scheme of the vector(s).
+  abstract AddressingScheme : IAddressingScheme
+
+  /// Returns the address operations associated with this index. The addresses of the
+  /// index are not necesarilly continuous integers from 0. This provides some operations
+  /// that can be used for implementing generic operations over any kind of indices.
+  abstract AddressOperations : IAddressOperations
+
+  /// Returns a (fully evaluated) collection with all keys in the index
+  abstract Keys : ReadOnlyCollection<'K>
+  
+  /// Returns a lazy sequence that iterates over all keys in the index
+  abstract KeySequence : seq<'K>
 
   /// Performs reverse lookup - and returns key for a specified address
   abstract KeyAt : Address -> 'K
+
+  /// Return an address that represents the specified offset
+  abstract AddressAt : int64 -> Address
 
   /// Returns the number of keys in the index
   abstract KeyCount : int64
@@ -147,7 +149,7 @@ type IIndex<'K when 'K : equality> =
   abstract Lookup : key:'K * lookup:Lookup * condition:(Address -> bool) -> OptionalValue<'K * Address>  
 
   /// Returns all key-address mappings in the index
-  abstract Mappings : seq<'K * Address>
+  abstract Mappings : seq<KeyValuePair<'K, Address>>
 
   /// Returns the minimal and maximal key associated with the index.
   /// (the operation may fail for unordered indices)
@@ -159,7 +161,7 @@ type IIndex<'K when 'K : equality> =
   /// Returns a comparer associated with the values used by the current index.
   abstract Comparer : System.Collections.Generic.Comparer<'K>
 
-  /// Returns an index builder that canbe used for constructing new indices of the
+  /// Returns an index builder that can be used for constructing new indices of the
   /// same kind as the current index (e.g. a lazy index returns a lazy index builder)
   abstract Builder : IIndexBuilder
 
@@ -198,17 +200,33 @@ and IIndexBuilder =
   /// should check and infer this from the data.
   abstract Create : seq<'K> * Option<bool> -> IIndex<'K>
   
-  /// When we perform some projection on the vector (e.g. `Series.map`), then we may also
-  /// need to perform some transformation on the index (because it will typically turn delayed
-  /// index into an evaluated index). This operation represents that - it should return 
-  /// (evaluated) index with the same keys.
+  /// Create a new index using the specified keys. This overload takes data as ReadOnlyCollection
+  /// and so it is more efficient if the caller already has the keys in an allocated collection.
+  /// Optionally, the caller can specify if the index keys are ordered or not. When the value 
+  /// is not set, the construction should check and infer this from the data.
+  abstract Create : ReadOnlyCollection<'K> * Option<bool> -> IIndex<'K>
+
+  /// When we perform some projection on the vector (`Select` or `Convert`), then we may also
+  /// need to perform some transformation on the index (because it may turn delayed index 
+  /// into an evaluated index). If the vector operation does that, then `Project` should do the 
+  /// same (e.g. evaluate) on the index.
   abstract Project : IIndex<'K> -> IIndex<'K>
+
+  /// When we create a new vector (`IVectorBuilder.Create`), then we may get a materialized
+  /// vector and we may need to perform the same transformation on the index. This is similar
+  /// to `Project`, but used in different scenarios.
+  abstract Recreate : IIndex<'K> -> IIndex<'K>
+
+  /// Create a new index that represents sub-range of an existing index.
+  /// The range is specified as a pair of addresses, which means that it can be 
+  /// used by operations such as "series.Take(5)" (which do not rely on keys)
+  abstract GetAddressRange : SeriesConstruction<'K> * RangeRestriction<Address> -> SeriesConstruction<'K>
 
   /// Create a new index that represents sub-range of an existing index. The range is specified
   /// as a pair of options (when `None`, the original left/right boundary should be used) 
   /// that contain boundary behavior and the boundary key.
   abstract GetRange : 
-    IIndex<'K> * option<'K * BoundaryBehavior> * option<'K * BoundaryBehavior> * VectorConstruction ->
+    SeriesConstruction<'K> * (option<'K * BoundaryBehavior> * option<'K * BoundaryBehavior>) ->
     SeriesConstruction<'K>
 
   /// Creates a union of two indices and builds corresponding vector transformations
@@ -226,10 +244,10 @@ and IIndexBuilder =
   /// Append two indices and builds corresponding vector transformations
   /// for both vectors that match the left and the right index. If the indices
   /// are ordered, the ordering should be preserved (the keys should be aligned).
-  /// The specified `IVectorValueTransform` defines how to deal with the case when
+  /// The specified `VectorListTransform` defines how to deal with the case when
   /// a key is defined in both indices (i.e. which value should be in the new vector).
-  abstract Append :
-    SeriesConstruction<'K> * SeriesConstruction<'K> * IVectorValueTransform -> 
+  abstract Merge :
+    list<SeriesConstruction<'K>> * VectorListTransform -> 
     IIndex<'K> * VectorConstruction
 
   /// Given an old index and a new index, build a vector transformation that reorders
@@ -247,11 +265,17 @@ and IIndexBuilder =
   /// Create a new index by picking a new key value for each key in the original index
   /// (used e.g. when we have a frame and want to use specified column as a new index).
   abstract WithIndex :
-    IIndex<'K> * (Address -> OptionalValue<'TNewKey>) * VectorConstruction -> 
+    IIndex<'K> * IVector<'TNewKey> * VectorConstruction -> 
     SeriesConstruction<'TNewKey>
 
   /// Drop an item associated with the specified key from the index. 
   abstract DropItem : SeriesConstruction<'K> * 'K -> SeriesConstruction<'K> 
+
+  /// Get a series construction that restricts the range of the input to only 
+  /// locations where the specified vector contains the specified value.
+  /// (used to filter frame rows according to a column value)
+  abstract Search<'K, 'V when 'K : equality and 'V : equality> : 
+    SeriesConstruction<'K> * IVector<'V> * 'V -> SeriesConstruction<'K>
 
   /// Get items associated with the specified key from the index. This method takes
   /// `ICustomLookup<K>` which provides an implementation of `ICustomKey<K>`. This 
@@ -260,6 +284,16 @@ and IIndexBuilder =
 
   /// Order (possibly unordered) index and return transformation that reorders vector
   abstract OrderIndex : SeriesConstruction<'K> -> SeriesConstruction<'K>
+
+  /// Shift the values in the series by a specified offset, in a specified direction.
+  /// The resulting series should be shorter by abs(offset); key for which there is no
+  /// value should be dropped. For example:
+  /// 
+  ///     (original)  (shift 1) (shift -1)
+  ///     a b c       _ b c     a b _
+  ///     1 2 3         1 2     1 2
+  /// 
+  abstract Shift : SeriesConstruction<'K> * int -> SeriesConstruction<'K>
 
   /// Aggregate an ordered index into floating windows or chunks. 
   ///
@@ -280,16 +314,16 @@ and IIndexBuilder =
   /// The operation results in a sequence of unique labels along with corresponding 
   /// series construction objects which can be applied to arbitrary vectors/columns.
   abstract GroupBy : index:IIndex<'K> * keySelector:('K -> OptionalValue<'TNewKey>) * VectorConstruction -> 
-    ('TNewKey * SeriesConstruction<'K>) seq when 'TNewKey : equality
+    ReadOnlyCollection<'TNewKey * SeriesConstruction<'K>> when 'TNewKey : equality
 
   /// Aggregate data into non-overlapping chunks by aligning them to the
   /// specified keys. The second parameter specifies the direction. If it is
   /// `Direction.Forward` than the key is the first element of a chunk; for 
   /// `Direction.Backward`, the key is the last element (note that this does not 
   /// hold at the boundaries where values before/after the key may also be included)
-  abstract Resample : IIndex<'K> * seq<'K> * Direction * source:VectorConstruction *
-    valueSelector:('TNewKey * SeriesConstruction<'K> -> OptionalValue<'R>) *
-    keySelector:('K * SeriesConstruction<'K> -> 'TNewKey) -> IIndex<'TNewKey> * IVector<'R>
+  abstract Resample : IIndexBuilder * IIndex<'K> * seq<'K> * Direction * source:VectorConstruction *
+    selector:('K * SeriesConstruction<'K> -> 'TNewKey * OptionalValue<'R>) 
+      -> IIndex<'TNewKey> * IVector<'R>
 
   /// Given an index and vector construction, return a new index asynchronously
   /// to allow composing evaluation of lazy series. The command to be applied to

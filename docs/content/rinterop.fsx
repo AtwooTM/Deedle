@@ -1,8 +1,7 @@
-﻿(*** hide ***)
+(*** hide ***)
 #nowarn "211"
-#I "../../packages/FSharp.Charting.0.87"
-#r "../../bin/MathNet.Numerics.dll"
-#I @"../../bin"
+#I "../../packages/FSharp.Charting"
+#I "../../bin"
 open System
 let airQuality = __SOURCE_DIRECTORY__ + "/data/AirQuality.csv"
 
@@ -24,31 +23,25 @@ The Deedle library comes with extension that automatically converts between Deed
 [zoo package](http://cran.r-project.org/web/packages/zoo/index.html) (Z's ordered 
 observations).
 
-To use Deedle and R provider together, all you need to do is to install the following
-NuGet package (this depends on the R provider and Deedle, so you do not need anything
-else).
-
-<div class="row">
-  <div class="span1"></div>
-  <div class="span6">
-    <div class="well well-small" id="nuget">
-      The F# DataFrame library can be <a href="https://nuget.org/packages/Deedle.RPlugin">installed from NuGet</a>:
-      <pre>PM> Install-Package Deedle.RPlugin</pre>
-    </div>
-  </div>
-  <div class="span1"></div>
-</div>
+This page is a quick overview showing how to pass data between R and Deedle.
+You can also get this page as an [F# script file](https://github.com/BlueMountainCapital/Deedle/blob/master/docs/content/rinterop.fsx)
+from GitHub and run the samples interactively.
 
 <a name="setup"></a>
+
 
 Getting started
 ---------------
 
+To use Deedle and R provider together, all you need to do is to install the 
+[**Deedle.RPlugin** package](https://nuget.org/packages/Deedle.RPlugin), which
+installes both as dependencies. Alternatively, you can use the [**FsLab**
+package](http://www.nuget.org/packages/FsLab), which also includes additional
+data access, data science and visualization libraries.
+
 In a typical project ("F# Tutorial"), the NuGet packages are installed in the `../packages`
 directory. To use R provider and Deedle, you need to write something like this:
 *)
-#I "../packages/Deedle.0.9.9-beta/"
-#I "../packages/RProvider.1.0.4/"
 #load "RProvider.fsx"
 #load "Deedle.fsx"
 
@@ -59,7 +52,7 @@ open Deedle
 
 If you're not using NuGet from Visual Studio, then you'll need to manually copy the
 file `Deedle.RProvider.Plugin.dll` from the package `Deedle.RPlugin` to the 
-directory where `RProvider.dll` is located (in `RProvider.1.0.4/lib`). Once that's
+directory where `RProvider.dll` is located (in `RProvider/lib`). Once that's
 done, the R provider will automatically find the plugin.
 
 <a name="frames"></a>
@@ -75,27 +68,20 @@ open `datasets` and access the `mtcars` data set using `R.mtcars` (when typing
 the code, you'll get automatic completion when you type `R` followed by dot):
 
 *)
+(*** define-output:mtcars ***)
 open RProvider.datasets
 
 // Get mtcars as an untyped object
 R.mtcars.Value
-// [fsi:val it : obj =]
-// [fsi:                      mpg  cyl disp  hp  drat wt    qsec  vs  am  gear carb ]
-// [fsi:Mazda RX4          -> 21   6   160   110 3.9  2.62  16.46 0   1   4    4    ]
-// [fsi:Mazda RX4 Wag      -> 21   6   160   110 3.9  2.875 17.02 0   1   4    4    ]
-// [fsi:Datsun 710         -> 22.8 4   108   93  3.85 2.32  18.61 1   1   4    1    ]
-// [fsi::                     ...  ... ...   ... ...  ...   ...   ... ... ...  ...  ]
-// [fsi:Maserati Bora      -> 15   8   301   335 3.54 3.57  14.6  0   1   5    8    ]
-// [fsi:Volvo 142E         -> 21.4 4   121   109 4.11 2.78  18.6  1   1   4    2    ]
 
 // Get mtcars as a typed Deedle frame
 let mtcars : Frame<string, string> = R.mtcars.GetValue()
-
+(*** include-value:mtcars ***)
 (**
 The first sample uses the `Value` property to convert the data set to a boxed Deedle
 frame of type `obj`. This is a great way to explore the data, but when you want to do 
 some further processing, you need to specify the type of the data frame that you want
-to get. This is done on line 13 where we get `mtcars` as a Deedle frame with both rows
+to get. This is done on line 7 where we get `mtcars` as a Deedle frame with both rows
 and columns indexed by `string`.
 
 To see that this is a standard Deedle data frame, let's group the cars by the number of
@@ -103,20 +89,19 @@ gears and calculate the average "miles per galon" value based on the gear. To vi
 the data, we use the [F# Charting library](https://github.com/fsharp/FSharp.Charting):
 
 *) 
+(*** define-output:mpgch ***)
 #load "FSharp.Charting.fsx"
 open FSharp.Charting
 
 mtcars
 |> Frame.groupRowsByInt "gear"
-|> Frame.meanLevel fst
-|> Frame.getSeries "mpg"
+|> Frame.getCol "mpg"
+|> Stats.levelMean fst
 |> Series.observations |> Chart.Column
 
-(**
+(*** include-it:mpgch ***)
 
-<div style="text-align:center;margin-right:100px;">
-<img src="images/mpg.png" style="height:300px;margin-left:30px" />
-</div>
+(**
 
 ### From Deedle to R
 
@@ -127,14 +112,8 @@ data frame as argument to standard R functions that expect data frame.
 *)
 
 let air = Frame.ReadCsv(airQuality, separators=";")
-// [fsi:val air : Frame<int,string> =]
-// [fsi:       Ozone     Solar.R   Wind Temp Month Day ]
-// [fsi:0   -> <missing> 190       7.4  67   5     1   ]
-// [fsi:1   -> 36        118       8    72   5     2   ]
-// [fsi:2   -> 12        149       12.6 74   5     3   ]
-// [fsi::      ...       ...       ...  ...  ...   ... ]
-// [fsi:151 -> 18        131       8    76   9     29  ]
-// [fsi:152 -> 20        223       11.5 68   9     30  ]
+
+(*** include-value:air ***)
 
 (**
 Let's first try passing the `air` frame to the R `as.data.frame` function (which 
@@ -149,7 +128,7 @@ R.as_data_frame(air)
 
 // Pass air data to R and get column means
 R.colMeans(air)
-// [fsi:val it : string =]
+// [fsi:val it : SymbolicExpression =]
 // [fsi:  Ozone  Solar.R  Wind  Temp  Month   Day ]
 // [fsi:    NaN      NaN  9.96 77.88   6.99  15.8]
 
@@ -170,7 +149,7 @@ and missing data for other columns are turned into `NA`. Here, we use `R.assign`
 stores the data frame in a varaible available in the current R environment:
 *)
 R.assign("x",  df)
-// [fsi:val it : string = ]
+// [fsi:val it : SymbolicExpression = ]
 // [fsi:     Floats   Names ]
 // [fsi: 1       10     one ] 
 // [fsi: 2      NaN    <NA> ]
@@ -185,15 +164,10 @@ Passing time series to and from R
 
 For working with time series data, the Deedle plugin uses [the zoo package](http://cran.r-project.org/web/packages/zoo/index.html) 
 (Z's ordered observations). If you do not have the package installed, you can do that
-by using the `install.packages("zoo")` command from R or using the following code from
-F# (when running the code from F#, you'll need to restart your editor and F# interactive
-after it is installed): 
-*)
+by using the `install.packages("zoo")` command from R or using `R.install_packages("zoo")` from
+F# after opening `RProvider.utils`. When running the code from F#, you'll need to restart your 
+editor and F# interactive after it is installed.
 
-open RProvider.utils
-R.install_packages("zoo")
-
-(**
 ### From R to Deedle
 
 Let's start by looking at getting time series data from R. We can again use the `datasets`
@@ -224,7 +198,7 @@ let twoYears = TimeSpan.FromDays(2.0 * 365.0)
 austres 
 |> Series.mapKeys (fun y -> 
     DateTime(int y, 1 + int (12.0 * (y - floor y)), 1))
-|> Series.windowDistInto twoYears Series.mean
+|> Series.windowDistInto twoYears Stats.mean
 (**
 
 The current version of the Deedle plugin supports only time series with single column.
@@ -278,6 +252,8 @@ time series (and data frames) from Deedle. As a final example, we create a data 
 contains the original time series together with the rolling mean (in a separate column)
 and then draws a chart showing the results:
 *)
+
+(*** define-output:means ***)
 // Use 'rollmean' to calculate mean and 'GetValue' to 
 // turn the result into a Deedle time series
 let tf = 
@@ -294,8 +270,6 @@ Chart.Combine
 
 (**
 Depending on your random number generator, the resulting chart looks something like this:
-
-<div style="text-align:center;margin-right:100px;">
-<img src="images/zoo-ts.png" style="margin-left:30px" />
-</div>
 *)
+
+(*** include-it:means ***)

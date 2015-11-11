@@ -34,7 +34,6 @@ let rpluginTags = "R RProvider"
 
 let gitHome = "https://github.com/BlueMountainCapital"
 let gitName = "Deedle"
-let testAssemblies = "tests/*/bin/Release/Deedle*Tests*.dll"
 
 // --------------------------------------------------------------------------------------
 // The rest of the code is standard F# build script 
@@ -56,32 +55,15 @@ Target "AssemblyInfo" (fun _ ->
 )
 
 // --------------------------------------------------------------------------------------
-// Update the assembly version numbers in the script file.
-
-open System.IO
-
-Target "UpdateFsxVersions" (fun _ ->
-    let pattern = "packages/Deedle.(.*)/lib/net40"
-    let replacement = sprintf "packages/Deedle.%s/lib/net40" release.NugetVersion
-    let path = "./src/Deedle/Deedle.fsx"
-    let text = File.ReadAllText(path)
-    let text = Text.RegularExpressions.Regex.Replace(text, pattern, replacement)
-    File.WriteAllText(path, text)
-)
-
-// --------------------------------------------------------------------------------------
-// Clean build results & restore NuGet packages
-
-Target "RestorePackages" (fun _ ->
-    !! "./**/packages.config"
-    |> Seq.iter (RestorePackage (fun p -> { p with ToolPath = "./.nuget/NuGet.exe" }))
-    // Restore packages does not run install script, so copy files for R provider by hand
-    !! "packages/R.NET.1.5.5/lib/net40/*" |> CopyFiles "packages/RProvider.1.0.4/lib/" 
-    !! "packages/RDotNet.FSharp.0.1.2.1/lib/net40/*" |> CopyFiles "packages/RProvider.1.0.4/lib/" 
-)
+// Clean build results
 
 Target "Clean" (fun _ ->
     CleanDirs ["bin"; "temp" ]
+
+    CleanDirs [ "tests/Deedle.CSharp.Tests/bin" ]
+    CleanDirs [ "tests/Deedle.RPlugin.Tests/bin" ]
+    CleanDirs [ "tests/Deedle.Tests/bin" ]
+    CleanDirs [ "tests/Deedle.Tests.Console/bin" ]
 )
 
 Target "CleanDocs" (fun _ ->
@@ -92,23 +74,34 @@ Target "CleanDocs" (fun _ ->
 // Build library & test project
 
 Target "Build" (fun _ ->
-    !! (project + "*.sln")
-    |> MSBuildRelease "" "Rebuild"
-    |> Log "AppBuild-Output: "
+    !! (project + ".sln")
+      |> MSBuildRelease "" "Rebuild"
+      |> Log "AppBuild-Output: "
+
+    !! ("tests/PerformanceTools.sln")
+      |> MSBuildRelease "" "Rebuild"
+      |> Log "AppBuild-Output: "
+  
+    !! (project + ".Tests.sln")
+      |> MSBuildRelease "" "Rebuild"
+      |> Log "AppBuild-Output: "
 )
+
+Target "BuildCore" (fun _ ->
+    !! (project + ".Core.sln")
+      |> MSBuildRelease "" "Rebuild"
+      |> Log "AppBuild-Output: "
+  )
 
 // --------------------------------------------------------------------------------------
 // Run the unit tests using test runner & kill test runner when complete
 
 Target "RunTests" (fun _ ->
-    let nunitVersion = GetPackageVersion "packages" "NUnit.Runners"
-    let nunitPath = sprintf "packages/NUnit.Runners.%s/Tools" nunitVersion
     ActivateFinalTarget "CloseTestRunner"
 
-    !! testAssemblies
+    !! "tests/Deedle.*Tests/bin/Release/Deedle*Tests*.dll"
     |> NUnit (fun p ->
         { p with
-            ToolPath = nunitPath
             DisableShadowCopy = true
             TimeOut = TimeSpan.FromMinutes 20.
             OutputFile = "TestResults.xml" })
@@ -125,7 +118,6 @@ Target "NuGet" (fun _ ->
     // Format the description to fit on a single line (remove \r\n and double-spaces)
     let description = description.Replace("\r", "").Replace("\n", "").Replace("  ", " ")
     let rpluginDescription = rpluginDescription.Replace("\r", "").Replace("\n", "").Replace("  ", " ")
-    let nugetPath = ".nuget/nuget.exe"
     NuGet (fun p -> 
         { p with   
             Authors = authors
@@ -136,7 +128,6 @@ Target "NuGet" (fun _ ->
             ReleaseNotes = String.concat " " release.Notes
             Tags = tags
             OutputPath = "bin"
-            ToolPath = nugetPath
             AccessKey = getBuildParamOrDefault "nugetkey" ""
             Publish = hasBuildParam "nugetkey" })
         ("nuget/" + project + ".nuspec")
@@ -150,7 +141,11 @@ Target "NuGet" (fun _ ->
             ReleaseNotes = String.concat " " release.Notes
             Tags = tags
             OutputPath = "bin"
-            ToolPath = nugetPath
+            Dependencies = 
+              [ "Deedle", release.NugetVersion
+                "R.NET.Community", GetPackageVersion "packages" "R.NET.Community"
+                "R.NET.Community.FSharp", GetPackageVersion "packages" "R.NET.Community.FSharp"
+                "RProvider", GetPackageVersion "packages" "RProvider" ]
             AccessKey = getBuildParamOrDefault "nugetkey" ""
             Publish = hasBuildParam "nugetkey" })
         ("nuget/Deedle.RPlugin.nuspec")
@@ -179,10 +174,33 @@ Target "ReleaseDocs" (fun _ ->
 Target "ReleaseBinaries" (fun _ ->
     Repository.clone "" (gitHome + "/" + gitName + ".git") "temp/release"
     Branches.checkoutBranch "temp/release" "release"
+    
+    // Delete old files and copy in new files
+    !! "temp/release/*" |> DeleteFiles
+    "temp/release/bin" |> CleanDir
     CopyRecursive "bin" "temp/release/bin" true |> printfn "%A"
+    !! "temp/release/bin/*.nupkg" |> DeleteFiles
+    "temp/release/bin/Deedle.fsx" |> MoveFile "temp/release"
+    "temp/release/bin/RProvider.fsx" |> MoveFile "temp/release"
+
+    CommandHelper.runSimpleGitCommand "temp/release" "add bin/*" |> printfn "%s"
     let cmd = sprintf """commit -a -m "Update binaries for version %s""" release.NugetVersion
     CommandHelper.runSimpleGitCommand "temp/release" cmd |> printfn "%s"
     Branches.push "temp/release"
+)
+
+Target "TagRelease" (fun _ ->
+    // Concatenate notes & create a tag in the local repository
+    let notes = (String.concat " " release.Notes).Replace("\n", ";").Replace("\r", "")
+    let tagName = "v" + release.NugetVersion
+    let cmd = sprintf """tag -a %s -m "%s" """ tagName notes
+    CommandHelper.runSimpleGitCommand "." cmd |> printfn "%s"
+
+    // Find the main remote (BlueMountain GitHub)
+    let _, remotes, _ = CommandHelper.runGitCommand "." "remote -v"
+    let main = remotes |> Seq.find (fun s -> s.Contains("(push)") && s.Contains("BlueMountainCapital/Deedle"))
+    let remoteName = main.Split('\t').[0]
+    Fake.Git.Branches.pushTag "." remoteName tagName
 )
 
 Target "Release" DoNothing
@@ -191,21 +209,27 @@ Target "Release" DoNothing
 // Run all targets by default. Invoke 'build <Target>' to override
 
 Target "All" DoNothing
+Target "AllCore" DoNothing
 
 "Clean"
-  ==> "RestorePackages"
-  ==> "UpdateFsxVersions"
   ==> "AssemblyInfo"
   ==> "Build"
-  ==> "RunTests"
-  ==> "All"
+  ==> "All" 
 
+"AssemblyInfo"
+  ==> "BuildCore"
+  ==> "AllCore"
+
+"RunTests" ==> "All"
+"RunTests" ==> "AllCore"
+
+"All" ==> "NuGet" ==> "Release"
 "All" 
   ==> "CleanDocs"
   ==> "GenerateDocs"
   ==> "ReleaseDocs"
   ==> "ReleaseBinaries"
-  ==> "NuGet"
+  ==> "TagRelease"
   ==> "Release"
 
 RunTargetOrDefault "All"

@@ -1,4 +1,4 @@
-﻿// --------------------------------------------------------------------------------------
+// --------------------------------------------------------------------------------------
 // Builds the documentation from `.fsx` and `.md` files in the 'docs/content' directory
 // (the generated documentation is stored in the 'docs/output' directory)
 // --------------------------------------------------------------------------------------
@@ -20,14 +20,10 @@ let info =
 // For typical project, no changes are needed below
 // --------------------------------------------------------------------------------------
 
-#I "../../packages/FSharp.Formatting.2.2.12-beta/lib/net40"
-#I "../../packages/RazorEngine.3.3.0/lib/net40/"
-#r "../../packages/Microsoft.AspNet.Razor.2.0.30506.0/lib/net40/System.Web.Razor.dll"
+#I "../../packages/FAKE/tools"
 #r "../../packages/FAKE/tools/FakeLib.dll"
-#r "RazorEngine.dll"
-#r "FSharp.Literate.dll"
-#r "FSharp.CodeFormat.dll"
-#r "FSharp.MetadataFormat.dll"
+#load "../../packages/FSharp.Formatting/FSharp.Formatting.fsx"
+#load "formatters.fsx"
 open Fake
 open System.IO
 open Fake.FileHelper
@@ -48,7 +44,7 @@ let content    = __SOURCE_DIRECTORY__ @@ "../content"
 let output     = __SOURCE_DIRECTORY__ @@ "../output"
 let files      = __SOURCE_DIRECTORY__ @@ "../files"
 let templates  = __SOURCE_DIRECTORY__ @@ "templates"
-let formatting = __SOURCE_DIRECTORY__ @@ "../../packages/FSharp.Formatting.2.2.12-beta/"
+let formatting = __SOURCE_DIRECTORY__ @@ "../../packages/FSharp.Formatting/"
 let docTemplate = formatting @@ "templates/docpage.cshtml"
 
 // Where to look for *.csproj templates (in this order)
@@ -63,22 +59,45 @@ let copyFiles () =
   CopyRecursive (formatting @@ "styles") (output @@ "content") true 
     |> Log "Copying styles and scripts: "
 
+// Based on https://github.com/fsprojects/ProjectScaffold/pull/135
+let references =
+  if isMono then
+    // Workaround compiler errors in Razor-ViewEngine
+    let d = RazorEngine.Compilation.ReferenceResolver.UseCurrentAssembliesReferenceResolver()
+    let loadedList = d.GetReferences () |> Seq.map (fun r -> r.GetFile()) |> Seq.cache
+    // We replace the list and add required items manually as mcs doesn't like duplicates...
+    let getItem name = loadedList |> Seq.find (fun l -> l.Contains name)
+    [ (getItem "FSharp.Core").Replace("4.3.0.0", "4.3.1.0")
+      Path.GetFullPath(formatting @@ "../FSharp.Compiler.Service/lib/net40/FSharp.Compiler.Service.dll")
+      Path.GetFullPath(formatting @@ "lib/net40/System.Web.Razor.dll")
+      Path.GetFullPath(formatting @@ "lib/net40/RazorEngine.dll")
+      Path.GetFullPath(formatting @@ "lib/net40/FSharp.Literate.dll")
+      Path.GetFullPath(formatting @@ "lib/net40/FSharp.CodeFormat.dll")
+      Path.GetFullPath(formatting @@ "lib/net40/FSharp.MetadataFormat.dll") ]
+    |> Some
+  else None
+
 // Build API reference from XML comments
 let buildReference () =
   CleanDir (output @@ "reference")
   for lib in referenceBinaries do
     MetadataFormat.Generate
       ( bin @@ lib, output @@ "reference", layoutRoots, 
-        parameters = ("root", root)::info )
+        parameters = ("root", root)::info,
+        sourceRepo = "https://github.com/BlueMountainCapital/Deedle/tree/master/",
+        sourceFolder = __SOURCE_DIRECTORY__.Substring(0, __SOURCE_DIRECTORY__.Length - "\docs\tools".Length),
+        ?assemblyReferences = references )
 
 // Build documentation from `fsx` and `md` files in `docs/content`
 let buildDocumentation () =
+  let fsiEvaluator = Formatters.createFsiEvaluator root output "#.####"
   let subdirs = Directory.EnumerateDirectories(content, "*", SearchOption.AllDirectories)
   for dir in Seq.append [content] subdirs do
     let sub = if dir.Length > content.Length then dir.Substring(content.Length + 1) else "."
     Literate.ProcessDirectory
       ( dir, docTemplate, output @@ sub, replacements = ("root", root)::info,
-        layoutRoots = layoutRoots )
+        layoutRoots = layoutRoots, fsiEvaluator = fsiEvaluator, generateAnchors = true,
+        ?assemblyReferences = references )
 
 // Generate
 copyFiles()
